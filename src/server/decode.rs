@@ -2,14 +2,12 @@
 
 use std::str::FromStr;
 
-use async_std::io::{BufReader, Read, Write};
-use async_std::{prelude::*, sync, task};
-use http_types::headers::{CONTENT_LENGTH, EXPECT, TRANSFER_ENCODING};
+use async_std::io::BufRead;
+use async_std::prelude::*;
+use http_types::headers::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http_types::{ensure, ensure_eq, format_err};
 use http_types::{Body, Method, Request, Url};
 
-use crate::chunked::ChunkedDecoder;
-use crate::read_notifier::ReadNotifier;
 use crate::{MAX_HEADERS, MAX_HEAD_LENGTH};
 
 const LF: u8 = b'\n';
@@ -20,19 +18,29 @@ const HTTP_1_1_VERSION: u8 = 1;
 const CONTINUE_HEADER_VALUE: &str = "100-continue";
 const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
+#[derive(Debug)]
+pub struct BodyInfo {
+    pub pipe: sluice::pipe::PipeWriter,
+    pub kind: BodyKind,
+}
+
+#[derive(Debug)]
+pub enum BodyKind {
+    Length(usize),
+    Chunked(http_types::trailers::Sender),
+}
+
 /// Decode an HTTP request on the server.
-pub async fn decode<IO>(mut io: IO) -> http_types::Result<Option<Request>>
-where
-    IO: Read + Write + Clone + Send + Sync + Unpin + 'static,
-{
-    let mut reader = BufReader::new(io.clone());
+pub async fn decode<IO: BufRead + Unpin>(
+    io: &mut IO,
+) -> http_types::Result<Option<(Request, Option<BodyInfo>)>> {
     let mut buf = Vec::new();
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut httparse_req = httparse::Request::new(&mut headers);
 
     // Keep reading bytes from the stream until we hit the end of the stream.
     loop {
-        let bytes_read = reader.read_until(LF, &mut buf).await?;
+        let bytes_read = io.read_until(LF, &mut buf).await?;
         // No more bytes are yielded from the stream.
         if bytes_read == 0 {
             return Ok(None);
@@ -88,6 +96,9 @@ where
         "Unexpected Content-Length header"
     );
 
+    // todo add back 100-continue support
+    /*
+
     // Establish a channel to wait for the body to be read. This
     // allows us to avoid sending 100-continue in situations that
     // respond without reading the body, saving clients from uploading
@@ -105,17 +116,24 @@ where
             // finish when the client disconnects, whether or not
             // 100-continue was sent.
         });
-    }
+    }*/
 
     // Check for Transfer-Encoding
     if let Some(encoding) = transfer_encoding {
         if encoding.last().as_str() == "chunked" {
             let trailer_sender = req.send_trailers();
-            let reader = ChunkedDecoder::new(reader, trailer_sender);
-            let reader = BufReader::new(reader);
-            let reader = ReadNotifier::new(reader, body_read_sender);
-            req.set_body(Body::from_reader(reader, None));
-            return Ok(Some(req));
+            //let reader = ChunkedDecoder::new(io, trailer_sender);
+            //let reader = ReadNotifier::new(reader, body_read_sender);
+            let (pipe_reader, pipe_writer) = sluice::pipe::pipe();
+            req.set_body(Body::from_reader(pipe_reader, None));
+
+            return Ok(Some((
+                req,
+                Some(BodyInfo {
+                    pipe: pipe_writer,
+                    kind: BodyKind::Chunked(trailer_sender),
+                }),
+            )));
         }
         // Fall through to Content-Length
     }
@@ -123,11 +141,21 @@ where
     // Check for Content-Length.
     if let Some(len) = content_length {
         let len = len.last().as_str().parse::<usize>()?;
-        let reader = ReadNotifier::new(reader.take(len as u64), body_read_sender);
-        req.set_body(Body::from_reader(reader, Some(len)));
+        //let reader = io.take(len as u64);
+        //let reader = ReadNotifier::new(reader, body_read_sender);
+        let (pipe_reader, pipe_writer) = sluice::pipe::pipe();
+        req.set_body(Body::from_reader(pipe_reader, Some(len)));
+
+        return Ok(Some((
+            req,
+            Some(BodyInfo {
+                pipe: pipe_writer,
+                kind: BodyKind::Length(len),
+            }),
+        )));
     }
 
-    Ok(Some(req))
+    Ok(Some((req, None)))
 }
 
 fn url_from_httparse_req(req: &httparse::Request<'_, '_>) -> http_types::Result<Url> {

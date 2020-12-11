@@ -24,8 +24,10 @@ http-types = "2.9.0"
 byte-pool = "0.2.2"
 lazy_static = "1.4.0"
 futures-core = "0.3.8"
+futures-util = { version = "0.3.8", features = ["io"] }
 log = "0.4.11"
 pin-project = "1.0.2"
+sluice = "0.5.3"
 
 [dev-dependencies]
 pretty_assertions = "0.6.1"
